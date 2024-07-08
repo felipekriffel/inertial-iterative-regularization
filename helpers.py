@@ -6,10 +6,10 @@ import numpy as np
 import ufl
 import matplotlib.pyplot as plt
 import dolfinx.fem.petsc
-from dolfinx.io import gmshio
 import time
 import pandas as pd
 import basix
+from petsc4py import PETSc
 
 class DirectProblem:
   def __init__(self,N):
@@ -22,6 +22,7 @@ class DirectProblem:
     self.mesh = dolfinx.mesh.create_unit_square(MPI.COMM_WORLD, N, N, dolfinx.mesh.CellType.triangle)
     Ve = basix.ufl.element('Lagrange', "triangle", degree=1, shape=())
     self.V = dolfinx.fem.functionspace(self.mesh, Ve) #Continuous Garlekin de grau 1 - funções afim em cada triângulo
+    self.V_array_size = self.V.dofmap.index_map.size_global
 
     #for setting boundary conditions
     self.mesh.topology.create_connectivity(self.mesh.topology.dim-1, self.mesh.topology.dim)
@@ -37,7 +38,14 @@ class DirectProblem:
     idy_list = [np.argsort(coord[idx_list[i]][:,1]) for i in range(N+1)]
     self.M_id = np.array([idx_list[i][idy_list[i]] for i in range(N+1)])
 
-    
+    # KSP solver
+    self.ksp = PETSc.KSP()
+    self.ksp.create(comm=self.mesh.comm)
+    self.ksp.setType(PETSc.KSP.Type.CG)
+    self.ksp.getPC().setType(PETSc.PC.Type.LU)    
+    #
+    self.assembled = False
+
   def solveDirect(self, c, f, uB = None):
     if uB==None:
       uB = dolfinx.fem.Function(self.V)
@@ -62,6 +70,20 @@ class DirectProblem:
     adj.x.array[:] = - u.x.array * psi.x.array
     return adj
 
+  def setProblem(self,c,bc):
+    u = ufl.TrialFunction(self.V)
+    v = ufl.TestFunction(self.V)
+
+    a = ufl.inner(ufl.grad(u),ufl.grad(v))*ufl.dx + ufl.inner(c*u,v)*ufl.dx
+    a_form = dolfinx.fem.form(a)
+
+    A = dolfinx.fem.petsc.assemble_matrix(a_form,bcs=[bc])
+    self.ksp.setOperators(A)
+    self.ksp.setFromOptions()
+    A.assemble()
+
+    return a_form
+    
   def directOperator(self,c,f_list,uB=None):
     """
     Resolve o problema para cada fi na lista
@@ -70,43 +92,42 @@ class DirectProblem:
     if uB == None:
       uB = dolfinx.fem.Function(self.V)
     
+    bc = dolfinx.fem.dirichletbc(uB, self.boundary_dofs)
+    
     u_list = []
 
+    v = ufl.TestFunction(self.V)
+    a_form = self.setProblem(c,bc)
+
     for fi in f_list:
-      u_list.append(self.solveDirect(c,fi,uB))
+      #setting right hand side vector
+      rhs = ufl.inner(fi,v)*ufl.dx
+      b = dolfinx.fem.petsc.assemble_vector(dolfinx.fem.form(rhs))
+      dolfinx.fem.petsc.apply_lifting(b, [a_form], [[bc]])
+      dolfinx.fem.petsc.set_bc(b,bcs=[bc])
+      
+      #solving
+      ui = dolfinx.fem.Function(self.V)
+      self.ksp.solve(b,ui.vector)
+      u_list.append(ui)
 
     return u_list
 
   def directOperatorDerivate(self,h,c,u_list):
-    derivative_list = []
-
-    for uk in u_list:
-      etak = self.solveDirect(c,-h*uk)
-      derivative_list.append(etak)
-
+    rhs_list = [-h*uk for uk in u_list]
+    derivative_list = self.directOperator(c,rhs_list)
     return derivative_list
 
   def directOperatorAdjoint(self, sigma_list,c,u_list):
-    adj_func_list = []
-
     #resolve a adjunta para cada direção sigma_i relativo ao u_i respectivo
     #armazena cada adunta numa lista
-    for ui,sigma_i in zip(u_list,sigma_list):
-      adj_i = self.solveAdjoint(sigma_i,c,ui)
-      adj_func_list.append(adj_i)
-
-    #cria lista com os vetores de coeficientes de cada adjunta
-    adj_array_list = [adj.x.array for adj in adj_func_list]
-
-    #cria função vazia para armazenar a adjunta
-    adj_func = dolfinx.fem.Function(self.V)
-
-    #armazena na função da adjunta a soma dos vetores de coeficientes
-    adj_func.x.array[:] = np.sum(adj_array_list,axis=0)
-
-
-    return adj_func
-
+    psi_list = self.directOperator(c,sigma_list)
+    adj_array = np.zeros(self.V_array_size)
+    for ui,psi in zip(u_list,psi_list):      
+      adj_array += -ui.x.array * psi.x.array
+    adj = dolfinx.fem.Function(self.V)
+    adj.x.array[:] = adj_array
+    return adj
 
   def plotFunc(self, u, warped=False):
       pyvista.start_xvfb()
@@ -186,7 +207,7 @@ class InverseProblem:
     return tx
 
   # 1 lado direito
-  def inLM(self, u_list, f_list, c, tau=1.1,delta=0, lmbda=0.1, alpha=1, lmbda_mult=1, n_iter=100):
+  def inLM(self, u_list, f_list, c, uB=None, tau=1.1,delta=0, lmbda=0.1, alpha=1, lmbda_mult=1, n_iter=100):
     """
     Função para médodo do Levenberg-Marquardt inercial
 
@@ -231,12 +252,12 @@ class InverseProblem:
     for i in range(n_iter):
       err_func.x.array[:] = ck.x.array-c.x.array
       err_norm_array[i] = funcSquareNorm(err_func)**0.5
-      uk_list = self.problem.directOperator(ck,f_list)
+      uk_list = self.problem.directOperator(ck,f_list,uB)
       res_sum = 0
 
       wk.x.array[:] = ck.x.array + alpha*(ck.x.array - ck_old.x.array)
 
-      Fwk_list = self.problem.directOperator(wk, f_list)
+      Fwk_list = self.problem.directOperator(wk, f_list,uB)
       #calcula residuo e bk
       for k in range(L):
         residual_list[k].x.array[:] = uk_list[k].x.array - u_list[k].x.array
@@ -264,7 +285,7 @@ class InverseProblem:
 
       lmbda *= lmbda_mult
 
-    uk_list = self.problem.directOperator(ck,f_list)
+    uk_list = self.problem.directOperator(ck,f_list,uB)
     res_sum = 0
     for k in range(L):
       residual_list[k].x.array[:] = uk_list[k].x.array - u_list[k].x.array
