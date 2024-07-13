@@ -118,6 +118,20 @@ class DirectProblem:
     derivative_list = self.directOperator(c,rhs_list)
     return derivative_list
 
+  def createFiList(self,n_grid_size, f_value):
+    N = self.N
+    index_array = np.linspace(0,(N+1),(n_grid_size)+2,dtype=int)[1:-1]
+    index_grid = np.dstack(np.meshgrid(index_array, index_array)).reshape(-1, 2)
+
+    f_list = [dolfinx.fem.Function(self.V) for i in range(n_grid_size**2)]
+    for i in range(n_grid_size**2):
+      fi = f_list[i]
+      index_i = self.M_id[index_grid[i][0]][index_grid[i][1]]
+
+      fi.x.array[index_i] = f_value
+
+    return f_list
+
   def directOperatorAdjoint(self, sigma_list,c,u_list):
     #resolve a adjunta para cada direção sigma_i relativo ao u_i respectivo
     #armazena cada adunta numa lista
@@ -300,6 +314,119 @@ class InverseProblem:
 
     return ck_sol, kdelta, err_norm_array, res_norm_array
 
+  def inLW(self, u_list, f_list, c, uB=None, tau=1.1,delta=0, alpha=0,n_iter=100):
+      """
+      Função para médodo do Levenberg-Marquardt inercial
+
+      Args:
+        u_list:     list of dolfinx.fem.Function, with (u_i) = F(c).
+        f_list:     list of dolfinx.fem.Function, with the rhs fi functions
+        c:          dolfinx.fem.Function, solution
+        tau:        float, discrepancy parameter
+        delta:      float, noise level 
+        lmbda:      float, step parameter (A^*A + lmbda * I) (default 0.1).
+        alpha:      float, inertial wk = ck + alpha *(c_k - c_(k-1)) (default 1.0).
+        lmbda_mult: float, update at each step lmbda *= lmbda_mult (default 1.0).
+        n_iter:     int, max number of iterations (default 100).
+
+      Returns:
+        ck_sol:         dolfinx.fem.Function(V), approximated solution
+        kdelta:     int, discrepancy index (if not reached, returns -1)
+        err_norm_array:   error norm array at each iteration
+        err_norm_array:   residual norm array at each iteration
+
+
+      """
+      V = self.problem.V
+      L = len(u_list)
+
+      c0 = dolfinx.fem.Function(V)
+      residual_list = [dolfinx.fem.Function(V) for i in range(L)]
+      c_norm = dolfinx.fem.assemble_scalar(dolfinx.fem.form(ufl.inner(c,c) * ufl.dx))**0.5
+      err_norm_array = np.zeros(n_iter+1)
+      res_norm_array = np.zeros(n_iter+1)
+      ck = c0
+      bk = [dolfinx.fem.Function(V) for i in range(L)]
+      
+      err_func = dolfinx.fem.Function(V)
+      ck_old = dolfinx.fem.Function(V)
+      wk = dolfinx.fem.Function(V)
+      ck_sol = dolfinx.fem.Function(V)
+
+      kdelta = -1
+
+      for i in range(n_iter):
+        err_func.x.array[:] = ck.x.array-c.x.array
+        err_norm_array[i] = funcSquareNorm(err_func)**0.5
+        uk_list = self.problem.directOperator(ck,f_list,uB)
+        res_sum = 0
+
+        wk.x.array[:] = ck.x.array + alpha*(ck.x.array - ck_old.x.array)
+
+        Fwk_list = self.problem.directOperator(wk, f_list,uB)
+
+        #calcula residuo e bk
+        for k in range(L):
+          residual_list[k].x.array[:] = uk_list[k].x.array - u_list[k].x.array
+          res_sum += funcSquareNorm(residual_list[k])
+
+          bk[k].x.array[:] = u_list[k].x.array - Fwk_list[k].x.array
+        res_norm_array[i] = (res_sum/L)**0.5
+
+        if kdelta==-1 and res_norm_array[i]<=tau*delta:
+          ck_sol.x.array[:] = ck.x.array
+          kdelta = i
+
+        #calcula (Ak)^* bk
+        adj_bk = self.problem.directOperatorAdjoint(bk, wk, uk_list)
+
+        #calcula sk
+        adj_norm_sq = funcSquareNorm(adj_bk)
+        res_norm_sq = 0
+        for res_i in residual_list:
+          res_norm_sq += funcSquareNorm(res_i)
+
+        step = res_norm_sq/(adj_norm_sq)
+        sk_array = step*adj_bk.x.array
+
+        #atualiza ck
+        ck_old.x.array[:] = ck.x.array
+        ck.x.array[:] = wk.x.array + sk_array
+
+
+      uk_list = self.problem.directOperator(ck,f_list,uB)
+      res_sum = 0
+      for k in range(L):
+        residual_list[k].x.array[:] = uk_list[k].x.array - u_list[k].x.array
+        res_sum += funcSquareNorm(residual_list[k])
+      res_norm_array[-1] = (res_sum/L)**0.5
+
+      err_func.x.array[:] = ck.x.array-c.x.array
+      err_norm_array[-1] = funcSquareNorm(err_func)**0.5
+
+      if kdelta==-1:
+        ck_sol.x.array[:] = ck.x.array
+
+      return ck_sol, kdelta, err_norm_array, res_norm_array
+
+  def addNoise(self,u_list,perc):
+    udelta_list = []
+    for u,err in zip(u_list,err_func_list):
+        noise_vec = np.random.uniform(-1,1,self.V_array_size)
+        u_delta = dolfinx.fem.Function(V)
+        u_delta.x.array[:] = u.x.array + u.x.array*(perc/100)*noise_vec
+        udelta_list.append(u_delta)
+
+    return u_delta_list
+
+  def computeDelta(self, u_list, u_list_delta):
+    err_func_list = [dolfinx.fem.Function(V) for i in range(L)]
+    for u,udelta, err in zip(u_list,u_list_delta,err_func_list):
+      err.x.array[:] = u.x.array - u_delta.x.array
+
+    delta = directOperatorNorm(err_func_list)
+    return delta
+
 def directOperatorNorm(u_list):
   L = len(u_list)
   norm_sum = 0
@@ -322,3 +449,72 @@ def directOperatorProduct(list_u,list_v):
     sum+= funcProduct(uk,vk)
 
   return sum
+
+def err_residual_graph(err_array,res_array,c,u_list,tau=None,delta=None,kdelta=None):
+  c_norm = funcSquareNorm(c)**0.5
+  u_norm = directOperatorNorm(u_list)
+
+  fig, ax = plt.subplots(1,2, figsize=(15,5))
+  ax[0].plot(err_array/c_norm,label=f'L={len(u_list)}')
+  if kdelta!=None and kdelta!=-1:
+    ax[0].plot([kdelta],[err_array[kdelta]/c_norm],linestyle ='',marker='.',markersize=5,label='$k_\delta$')
+  ax[0].set_title("Erro Relativo")
+  ax[0].set_ylabel("$e_k = \|c_k - c\|_{L^2}$")
+  ax[0].set_xlabel("k")
+  ax[0].legend()
+
+  ax[1].plot(res_array/u_norm,label=f'L={len(u_list)}')
+  ax[1].set_title("Resíduo")
+  ax[1].set_ylabel("$r_k = \|F(c_k) - F(c)\|_{L^2(\Omega)}$")
+  ax[1].set_xlabel("k")
+  if tau!=None and delta!=None:
+    ax[1].axhline(y=tau*delta/u_norm,label='$\\tau \delta$',color='orange')
+  ax[1].legend()
+  plt.show()
+
+def err_residual_graph_list(err_array_list,res_array_list,c,u_lists,tau=None,delta_list=[],kdelta_list=[]):
+  c_norm = funcSquareNorm(c)**0.5
+
+  fig, ax = plt.subplots(1,2, figsize=(15,5))
+
+  for  err_array, res_array, u_list in zip(err_array_list,res_array_list,u_lists):
+    u_norm = directOperatorNorm(u_list)
+    ax[0].plot(err_array/c_norm,label=f'L={len(u_list)}')
+    # if kdelta!=None and kdelta!=-1:
+    #   ax[0].plot([kdelta],[err_array[kdelta]/c_norm],linestyle ='',marker='.',markersize=5,label='$k_\delta$')
+    
+    ax[1].plot(res_array/u_norm,label=f'L={len(u_list)}')
+
+  ax[0].set_title("Erro Relativo")
+  ax[0].set_ylabel("$e_k = \|c_k - c\|_{L^2}$")
+  ax[0].set_xlabel("k")
+  ax[0].legend()
+
+  ax[1].set_title("Resíduo")
+  ax[1].set_ylabel("$r_k = \|F(c_k) - F(c)\|_{L^2(\Omega)}$")
+  ax[1].set_xlabel("k")
+  ax[1].legend()
+  plt.show()
+
+
+def plotFuncList(u_list,warped=False):
+  V = u_list[0].function_space
+  u_topology, u_cell_types, u_geometry = dolfinx.plot.vtk_mesh(V)
+  pyvista.start_xvfb()
+  u_grid = pyvista.UnstructuredGrid(u_topology, u_cell_types, u_geometry)
+  u_plotter = pyvista.Plotter(notebook=True)
+  for u in u_list:
+    u_grid.point_data["u"] = u.x.array
+    u_grid.set_active_scalars("u")
+    
+    if warped:
+        warped = u_grid.warp_by_scalar()
+        u_plotter.add_mesh(warped, show_edges=True, show_scalar_bar=True)
+    else:
+        u_plotter.add_mesh(u_grid, show_edges=True)
+        u_plotter.view_xy()
+
+    if not pyvista.OFF_SCREEN:
+        u_plotter.show()
+    if pyvista.OFF_SCREEN:
+        figure = p.screenshot("disk.png")
