@@ -118,17 +118,28 @@ class DirectProblem:
     derivative_list = self.directOperator(c,rhs_list)
     return derivative_list
 
-  def createFiList(self,n_grid_size, f_value):
+  def createFiList(self,n_grid_size, r, f_value=None):
     N = self.N
     index_array = np.linspace(0,(N+1),(n_grid_size)+2,dtype=int)[1:-1]
     index_grid = np.dstack(np.meshgrid(index_array, index_array)).reshape(-1, 2)
 
     f_list = [dolfinx.fem.Function(self.V) for i in range(n_grid_size**2)]
-    for i in range(n_grid_size**2):
-      fi = f_list[i]
-      index_i = self.M_id[index_grid[i][0]][index_grid[i][1]]
+    # for i in range(n_grid_size**2):
+    #   fi = f_list[i]
+    #   index_i = self.M_id[index_grid[i][0]][index_grid[i][1]]
+    #   fi.x.array[index_i] = f_value
+    coord_array = self.V.tabulate_dof_coordinates().T
 
-      fi.x.array[index_i] = f_value
+    for i in range(n_grid_size):
+      for j in range(n_grid_size):
+        circle_locator = get_circle_locator((1+i)/(n_grid_size+1),(1+j)/(n_grid_size+1), r)
+        fi = f_list[i*n_grid_size+j]
+        fi.x.array[:] = circle_locator(coord_array)
+        if f_value==None:
+          fi_norm = funcSquareNorm(fi)**0.5
+          fi.x.array[:] = fi.x.array[:]/fi_norm
+        else:
+          fi.x.array[:] = fi.x.array * f_value
 
     return f_list
 
@@ -138,29 +149,31 @@ class DirectProblem:
     psi_list = self.directOperator(c,sigma_list)
     adj_array = np.zeros(self.V_array_size)
     for ui,psi in zip(u_list,psi_list):      
-      adj_array += -ui.x.array * psi.x.array
+      adj_array += - ui.x.array * psi.x.array
     adj = dolfinx.fem.Function(self.V)
     adj.x.array[:] = adj_array
     return adj
 
   def plotFunc(self, u, warped=False):
-      pyvista.start_xvfb()
-      u_grid = pyvista.UnstructuredGrid(self.u_topology, self.u_cell_types, self.u_geometry)
-      u_grid.point_data["u"] = u.x.array
-      u_grid.set_active_scalars("u")
-      u_plotter = pyvista.Plotter(notebook=True)
+    pyvista.start_xvfb()
+    u_grid = pyvista.UnstructuredGrid(self.u_topology, self.u_cell_types, self.u_geometry)
+    u_grid.point_data["u"] = u.x.array
+    u_grid.set_active_scalars("u")
+    u_plotter = pyvista.Plotter(notebook=True)
 
-      if warped:
-          warped = u_grid.warp_by_scalar()
-          u_plotter.add_mesh(warped, show_edges=True, show_scalar_bar=True)
-      else:
-          u_plotter.add_mesh(u_grid, show_edges=True)
-          u_plotter.view_xy()
+    if warped:
+        warped = u_grid.warp_by_scalar()
+        u_plotter.add_mesh(warped, show_edges=True, show_scalar_bar=True)
+    else:
+        u_plotter.add_mesh(u_grid, show_edges=True)
+        u_plotter.view_xy()
 
-      if not pyvista.OFF_SCREEN:
-          u_plotter.show()
-      if pyvista.OFF_SCREEN:
-          figure = p.screenshot("disk.png")
+    if not pyvista.OFF_SCREEN:
+        u_plotter.show()
+    if pyvista.OFF_SCREEN:
+        figure = p.screenshot("disk.png")
+      
+    u_plotter.close()
 
 class InverseProblem:
 
@@ -285,10 +298,10 @@ class InverseProblem:
         kdelta = i
 
       #calcula (Ak)^* bk
-      adj_bk = self.problem.directOperatorAdjoint(bk, wk, uk_list)
+      adj_bk = self.problem.directOperatorAdjoint(bk, wk, Fwk_list)
 
       #define ((Ak)^*Ak + lmbda I)
-      Ak = lambda x: self.tikhonovOp(x, lmbda, wk, uk_list)
+      Ak = lambda x: self.tikhonovOp(x, lmbda, wk, Fwk_list)
 
       #calcula sk
       sk = self.conjugateGradient(Ak,adj_bk,dolfinx.fem.Function(V),tol=1e-10,maxit=3)
@@ -314,9 +327,106 @@ class InverseProblem:
 
     return ck_sol, kdelta, err_norm_array, res_norm_array
 
-  def inLW(self, u_list, f_list, c, uB=None, tau=1.1,delta=0, alpha=0,n_iter=100):
+  def inLW(self, u_list, f_list, c, uB=None, tau=1.1,delta=0, alpha=0,lmbda=1,lmbda_mult=1,n_iter=100,eta=0.5):
       """
-      Função para médodo do Levenberg-Marquardt inercial
+      Função para médodo do Landweber inercial
+
+      Args:
+        u_list:     list of dolfinx.fem.Function, with (u_i) = F(c).
+        f_list:     list of dolfinx.fem.Function, with the rhs fi functions
+        c:          dolfinx.fem.Function, solution
+        tau:        float, discrepancy parameter
+        delta:      float, noise level 
+        lmbda:      float, step parameter (A^*A + lmbda * I) (default 0.1).
+        alpha:      float, inertial wk = ck + alpha *(c_k - c_(k-1)) (default 1.0).
+        lmbda_mult: float, update at each step lmbda *= lmbda_mult (default 1.0).
+        n_iter:     int, max number of iterations (default 100).
+
+      Returns:
+        ck_sol:         dolfinx.fem.Function(V), approximated solution
+        kdelta:     int, discrepancy index (if not reached, returns -1)
+        err_norm_array:   error norm array at each iteration
+        err_norm_array:   residual norm array at each iteration
+
+
+      """
+      V = self.problem.V
+      L = len(u_list)
+
+      c0 = dolfinx.fem.Function(V)
+      residual_list = [dolfinx.fem.Function(V) for i in range(L)]
+      c_norm = dolfinx.fem.assemble_scalar(dolfinx.fem.form(ufl.inner(c,c) * ufl.dx))**0.5
+      u_norm = directOperatorNorm(u_list)
+      err_norm_array = np.zeros(n_iter+1)
+      res_norm_array = np.zeros(n_iter+1)
+      ck = c0
+      bk = [dolfinx.fem.Function(V) for i in range(L)]
+      
+      err_func = dolfinx.fem.Function(V)
+      ck_old = dolfinx.fem.Function(V)
+      wk = dolfinx.fem.Function(V)
+      ck_sol = dolfinx.fem.Function(V)
+
+      kdelta = -1
+
+      for i in range(n_iter):
+        err_func.x.array[:] = ck.x.array-c.x.array
+        err_norm_array[i] = funcSquareNorm(err_func)**0.5
+        uk_list = self.problem.directOperator(ck,f_list,uB)
+        res_sum = 0
+
+        wk.x.array[:] = ck.x.array + alpha*(ck.x.array - ck_old.x.array)
+
+        Fwk_list = self.problem.directOperator(wk, f_list,uB)
+
+        #calcula residuo e bk
+        for k in range(L):
+          residual_list[k].x.array[:] = uk_list[k].x.array - u_list[k].x.array
+          res_sum += funcSquareNorm(residual_list[k])
+
+          bk[k].x.array[:] = u_list[k].x.array - Fwk_list[k].x.array
+        res_norm_array[i] = (res_sum/L)**0.5
+
+        if kdelta==-1 and res_norm_array[i]<=tau*(delta/100)*u_norm:
+          ck_sol.x.array[:] = ck.x.array
+          kdelta = i
+  
+        #calcula (Ak)^* bk
+        adj_bk = self.problem.directOperatorAdjoint(bk, wk, Fwk_list)
+        #calcula sk
+        if lmbda_mult=='ME':
+          adj_norm_sq = funcSquareNorm(adj_bk)
+          res_norm_sq = 0
+          for bki in bk:
+            res_norm_sq += funcSquareNorm(bki)
+          step = ((1-eta)*res_norm_sq)/(adj_norm_sq) #regular o Eta
+        else:
+          step = lmbda
+        sk_array = step*adj_bk.x.array
+
+        #atualiza ck
+        ck_old.x.array[:] = ck.x.array
+        ck.x.array[:] = wk.x.array + sk_array
+
+
+      uk_list = self.problem.directOperator(ck,f_list,uB)
+      res_sum = 0
+      for k in range(L):
+        residual_list[k].x.array[:] = uk_list[k].x.array - u_list[k].x.array
+        res_sum += funcSquareNorm(residual_list[k])
+      res_norm_array[-1] = (res_sum/L)**0.5
+
+      err_func.x.array[:] = ck.x.array-c.x.array
+      err_norm_array[-1] = funcSquareNorm(err_func)**0.5
+
+      if kdelta==-1:
+        ck_sol.x.array[:] = ck.x.array
+
+      return ck_sol, kdelta, err_norm_array, res_norm_array
+
+  def stocLW(self, u_list, f_list, c, uB=None, tau=1.1,delta=0, alpha=0,n_iter=100):
+      """
+      Função para médodo do Landweber estocástico
 
       Args:
         u_list:     list of dolfinx.fem.Function, with (u_i) = F(c).
@@ -365,7 +475,7 @@ class InverseProblem:
 
         Fwk_list = self.problem.directOperator(wk, f_list,uB)
 
-        #calcula residuo e bk
+        #calcula residuo
         for k in range(L):
           residual_list[k].x.array[:] = uk_list[k].x.array - u_list[k].x.array
           res_sum += funcSquareNorm(residual_list[k])
@@ -377,16 +487,21 @@ class InverseProblem:
           ck_sol.x.array[:] = ck.x.array
           kdelta = i
 
-        #calcula (Ak)^* bk
-        adj_bk = self.problem.directOperatorAdjoint(bk, wk, uk_list)
+        #escolhe indice j
+        #calcula (Aj)^* bj
+        j = np.random.randint(0,L)
+        adj_bk = self.problem.directOperatorAdjoint(bk[j:j+1], wk, Fwk_list[j:j+1])
 
         #calcula sk
         adj_norm_sq = funcSquareNorm(adj_bk)
         res_norm_sq = 0
-        for res_i in residual_list:
-          res_norm_sq += funcSquareNorm(res_i)
-
-        step = res_norm_sq/(adj_norm_sq)
+        for bki in bk[j:j+1]:
+          res_norm_sq += funcSquareNorm(bki)
+        
+        if adj_norm_sq>0:
+          step = ((1-0.9)*res_norm_sq)/(adj_norm_sq)
+        else:
+          step = 100
         sk_array = step*adj_bk.x.array
 
         #atualiza ck
@@ -410,18 +525,19 @@ class InverseProblem:
       return ck_sol, kdelta, err_norm_array, res_norm_array
 
   def addNoise(self,u_list,perc):
-    udelta_list = []
-    for u,err in zip(u_list,err_func_list):
-        noise_vec = np.random.uniform(-1,1,self.V_array_size)
-        u_delta = dolfinx.fem.Function(V)
+    u_delta_list = []
+    for u in u_list:
+        noise_vec = np.random.uniform(-1,1,self.problem.V_array_size)
+        u_delta = dolfinx.fem.Function(self.problem.V)
         u_delta.x.array[:] = u.x.array + u.x.array*(perc/100)*noise_vec
-        udelta_list.append(u_delta)
+        u_delta_list.append(u_delta)
 
     return u_delta_list
 
   def computeDelta(self, u_list, u_list_delta):
-    err_func_list = [dolfinx.fem.Function(V) for i in range(L)]
-    for u,udelta, err in zip(u_list,u_list_delta,err_func_list):
+    L = len(u_list)
+    err_func_list = [dolfinx.fem.Function(self.problem.V) for i in range(L)]
+    for u,u_delta, err in zip(u_list,u_list_delta,err_func_list):
       err.x.array[:] = u.x.array - u_delta.x.array
 
     delta = directOperatorNorm(err_func_list)
@@ -497,24 +613,56 @@ def err_residual_graph_list(err_array_list,res_array_list,c,u_lists,tau=None,del
   plt.show()
 
 
+
+def plotFunc(u,warped=False):
+  V = u.function_space
+  u_topology, u_cell_types, u_geometry = dolfinx.plot.vtk_mesh(V)
+  pyvista.start_xvfb()
+  u_grid = pyvista.UnstructuredGrid(u_topology, u_cell_types, u_geometry)
+  u_plotter = pyvista.Plotter(notebook=True)
+
+  u_grid.point_data["u"] = u.x.array
+  u_grid.set_active_scalars("u")
+  
+  if warped:
+    warped = u_grid.warp_by_scalar()
+    u_plotter.add_mesh(warped, show_edges=True, show_scalar_bar=True)
+  else:
+    u_plotter.add_mesh(u_grid, show_edges=True)
+    u_plotter.view_xy()
+
+  # if not pyvista.OFF_SCREEN:
+  u_plotter.show()
+  # if pyvista.OFF_SCREEN:
+  #     figure = p.screenshot("disk.png")
+
+  u_plotter.close()
+
+
 def plotFuncList(u_list,warped=False):
   V = u_list[0].function_space
   u_topology, u_cell_types, u_geometry = dolfinx.plot.vtk_mesh(V)
   pyvista.start_xvfb()
   u_grid = pyvista.UnstructuredGrid(u_topology, u_cell_types, u_geometry)
   u_plotter = pyvista.Plotter(notebook=True)
+  
   for u in u_list:
     u_grid.point_data["u"] = u.x.array
     u_grid.set_active_scalars("u")
     
     if warped:
-        warped = u_grid.warp_by_scalar()
-        u_plotter.add_mesh(warped, show_edges=True, show_scalar_bar=True)
+      warped = u_grid.warp_by_scalar()
+      u_plotter.add_mesh(warped, show_edges=True, show_scalar_bar=True)
     else:
-        u_plotter.add_mesh(u_grid, show_edges=True)
-        u_plotter.view_xy()
+      u_plotter.add_mesh(u_grid, show_edges=True)
+      u_plotter.view_xy()
 
-    if not pyvista.OFF_SCREEN:
-        u_plotter.show()
-    if pyvista.OFF_SCREEN:
-        figure = p.screenshot("disk.png")
+    # if not pyvista.OFF_SCREEN:
+    u_plotter.show()
+    # if pyvista.OFF_SCREEN:
+    #     figure = p.screenshot("disk.png")
+
+  u_plotter.close()
+
+def get_circle_locator(cx,cy,r):
+  return lambda x: ((x[0]-cx)**2 + (x[1]-cy)**2 <= r**2).astype(int)
