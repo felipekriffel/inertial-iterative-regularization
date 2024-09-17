@@ -327,7 +327,7 @@ class InverseProblem:
 
     return ck_sol, kdelta, err_norm_array, res_norm_array
 
-  def inLW(self, u_list, f_list, c, uB=None, tau=1.1,delta=0, alpha=0,lmbda=1,lmbda_mult=1,n_iter=100,eta=0.5):
+  def inLW(self, u_list, f_list, c, uB=None, tau=1.1,delta=0, alpha=0,lmbda=1,n_iter=100,eta=0):
       """
       Função para médodo do Landweber inercial
 
@@ -387,19 +387,40 @@ class InverseProblem:
           bk[k].x.array[:] = u_list[k].x.array - Fwk_list[k].x.array
         res_norm_array[i] = (res_sum/L)**0.5
 
+        #checa discrepância
         if kdelta==-1 and res_norm_array[i]<=tau*(delta/100)*u_norm:
           ck_sol.x.array[:] = ck.x.array
           kdelta = i
   
         #calcula (Ak)^* bk
         adj_bk = self.problem.directOperatorAdjoint(bk, wk, Fwk_list)
+        
         #calcula sk
-        if lmbda_mult=='ME':
+        if lmbda=='ME':
           adj_norm_sq = funcSquareNorm(adj_bk)
           res_norm_sq = 0
           for bki in bk:
             res_norm_sq += funcSquareNorm(bki)
-          step = ((1-eta)*res_norm_sq)/(adj_norm_sq) #regular o Eta
+
+          if eta=='adjusted':
+              if i==0:
+                const=1
+              else:
+                derivative = self.problem.directOperatorDerivate(ck-ck_old,ck_old,Fwk_list)
+                der_err = [dolfinx.fem.Function(V) for i in range(i)]
+                err = [dolfinx.fem.Function(V) for i in range(i)]
+                Fck = self.problem.directOperator(ck,f_list)
+                Fckold = self.problem.directOperator(ck_old,f_list)
+                for i in range(L):
+                  err[i].x.array[:] = Fck[i].x.array - Fckold[i].x.array
+                  der_err[i].x.array[:] = derivative[i].x.array - err[i].x.array
+                der_norm = directOperatorNorm(der_err)
+                err_norm = directOperatorNorm(err)
+                const = 1 - der_norm/err_norm
+                print(const)
+          else:
+            const=1-eta
+          step = (const*res_norm_sq)/(adj_norm_sq) #regular o Eta
         else:
           step = lmbda
         sk_array = step*adj_bk.x.array
